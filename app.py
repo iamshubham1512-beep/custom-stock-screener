@@ -3,6 +3,7 @@ import pandas as pd
 import yfinance as yf
 from datetime import datetime
 import os
+import numpy as np
 
 # ======================
 # 🎯 APP CONFIGURATION
@@ -17,11 +18,7 @@ st.write("Select a year to view top-performing NSE stocks based on yearly price 
 # ======================
 @st.cache_data
 def load_stock_list():
-    """
-    Loads the stock symbols from 'NSE Stocks List.csv' expected in repo root.
-    Required column: 'SYMBOL' (uppercase).
-    Returns a list of symbols (strings).
-    """
+    """Load stock symbols from CSV"""
     try:
         df = pd.read_csv("NSE Stocks List.csv")
         if "SYMBOL" not in df.columns:
@@ -44,53 +41,34 @@ symbols = load_stock_list()
 year = st.selectbox("Select Year", options=list(range(2019, datetime.now().year + 1))[::-1])
 
 # ======================
-# ⚡ FASTER YEARLY DATA FETCHING (Optimized)
+# ⚡ FETCH DATA FUNCTION
 # ======================
 @st.cache_data(ttl=3600)
-def fetch_yearly_data(symbols, year, show_progress=False):
-    """
-    Optimized version:
-    - Fetches monthly OHLCV data instead of daily (interval='1mo') → ~95% faster
-    - Uses cached CSV if available to avoid refetching
-    """
+def fetch_yearly_data(symbols, year):
+    """Fetch monthly OHLCV data and calculate yearly change"""
     start_date = f"{year}-01-01"
     end_date = f"{year}-12-31"
-    cache_filename = f"Fetched_Symbols_{year}.csv"
+    cache_folder = "cache"
+    os.makedirs(cache_folder, exist_ok=True)
+    cache_filename = os.path.join(cache_folder, f"Fetched_Symbols_{year}.csv")
 
-    # ======================
     # 🔁 Check Local Cache
-    # ======================
     if os.path.exists(cache_filename):
         try:
             cached_df = pd.read_csv(cache_filename, index_col=0)
             st.info(f"📦 Loaded cached data from {cache_filename}")
-            # Filter only positive gainers
             df_final = cached_df[cached_df["% Change"] > 0].sort_values(by="% Change", ascending=False)
             df_final.index = range(1, len(df_final) + 1)
-            return df_final, {
-                "requested": len(symbols),
-                "fetched_with_data": len(cached_df),
-                "positive_gainers": len(df_final),
-                "skipped_empty": 0,
-                "failed": 0,
-                "failed_details": []
-            }, cached_df
+            return df_final, cached_df
         except Exception as e:
             st.warning(f"⚠️ Failed to read cached file: {e}. Fetching fresh data...")
 
-    # ======================
-    # 🧠 Fetch Fresh Data (Monthly)
-    # ======================
-    collected, collected_all, failed, skipped_empty = [], [], [], []
-    total = len(symbols)
-
-    for idx, sym in enumerate(symbols, start=1):
+    collected_all = []
+    for sym in symbols:
         ticker_symbol = sym if "." in sym else f"{sym}.NS"
         try:
             df = yf.download(ticker_symbol, start=start_date, end=end_date, interval="1mo", progress=False)
-
             if df.empty:
-                skipped_empty.append(sym)
                 continue
 
             open_series = df["Open"].dropna()
@@ -98,13 +76,11 @@ def fetch_yearly_data(symbols, year, show_progress=False):
             vol_series = df["Volume"].dropna()
 
             if open_series.empty or close_series.empty:
-                skipped_empty.append(sym)
                 continue
 
             open_price = float(open_series.iloc[0])
             close_price = float(close_series.iloc[-1])
             if open_price == 0:
-                skipped_empty.append(sym)
                 continue
 
             pct_change = round(((close_price - open_price) / open_price) * 100, 2)
@@ -115,18 +91,14 @@ def fetch_yearly_data(symbols, year, show_progress=False):
                 "Open Price": round(open_price, 2),
                 "Close Price": round(close_price, 2),
                 "% Change": pct_change,
-                "Avg. Volume": avg_volume
+                "Avg. Volume": avg_volume,
             }
 
             collected_all.append(row)
-            if pct_change > 0:
-                collected.append(row)
 
-        except Exception as e:
-            failed.append({"symbol": sym, "error": str(e)})
+        except Exception:
             continue
 
-    # Build DataFrames
     df_all = pd.DataFrame(collected_all).sort_values(by="% Change", ascending=False).reset_index(drop=True)
     df_all.index += 1
     df_all.index.name = "Sl. No."
@@ -134,22 +106,12 @@ def fetch_yearly_data(symbols, year, show_progress=False):
     df_final = df_all[df_all["% Change"] > 0].copy()
     df_final.index = range(1, len(df_final) + 1)
 
-    # ======================
     # 💾 Save Cached Copy
-    # ======================
     if not df_all.empty:
         df_all.to_csv(cache_filename, index=True)
 
-    stats = {
-        "requested": total,
-        "fetched_with_data": len(df_all),
-        "positive_gainers": len(df_final),
-        "skipped_empty": len(skipped_empty),
-        "failed": len(failed),
-        "failed_details": failed[:10]
-    }
+    return df_final, df_all
 
-    return df_final, stats, df_all
 
 # ======================
 # 🔍 FETCH BUTTON
@@ -157,43 +119,95 @@ def fetch_yearly_data(symbols, year, show_progress=False):
 if symbols:
     if st.button("🔎 Fetch Yearly Data"):
         with st.spinner(f"Fetching data for {year}... Please wait (optimized)..."):
-            df_result, stats, df_all = fetch_yearly_data(symbols, year)
+            df_result, df_all = fetch_yearly_data(symbols, year)
 
             if not df_result.empty:
-                st.success(f"✅ Found {stats['positive_gainers']} positive gainers out of {stats['requested']} requested symbols.")
-                st.dataframe(df_result, use_container_width=True)
-
-                csv = df_result.to_csv(index=True).encode("utf-8")
-                st.download_button(
-                    label="⬇️ Download CSV (positive gainers)",
-                    data=csv,
-                    file_name=f"Top_Gainers_{year}.csv",
-                    mime="text/csv",
-                )
-
+                st.session_state["fetched_data"] = df_result  # ✅ Store in session
+                st.session_state["fetched_year"] = year
+                st.success(f"✅ Found {len(df_result)} positive gainers out of {len(df_all)} fetched symbols.")
             else:
-                st.warning("⚠️ No positive gainers found. Showing fallback view.")
-                st.info(
-                    f"Requested: {stats['requested']} • With data: {stats['fetched_with_data']} • "
-                    f"Positive gainers: {stats['positive_gainers']} • Skipped empty: {stats['skipped_empty']} • Failed: {stats['failed']}"
-                )
-
-                if not df_all.empty:
-                    st.subheader("Top movers (by % Change) — fallback view")
-                    st.dataframe(df_all.head(20), use_container_width=True)
-                    csv_all = df_all.to_csv(index=True).encode("utf-8")
-                    st.download_button(
-                        label="⬇️ Download fallback data (all fetched symbols)",
-                        data=csv_all,
-                        file_name=f"Fetched_Symbols_{year}.csv",
-                        mime="text/csv",
-                    )
-                else:
-                    st.error("No symbol returned any data. Verify your symbol list or year selection.")
-    else:
-        st.info("👆 Select a year and click **Fetch Yearly Data** to start.")
+                st.warning("⚠️ No positive gainers found.")
+                st.session_state["fetched_data"] = None
 else:
     st.stop()
+
+# ======================
+# 🎛️ REAL-TIME FILTERS (Persistent)
+# ======================
+if "fetched_data" in st.session_state and st.session_state["fetched_data"] is not None:
+    df_result = st.session_state["fetched_data"]
+    st.subheader(f"📊 Filter Results for {st.session_state['fetched_year']}")
+
+    # Safely calculate slider limits
+    try:
+        open_min = int(np.floor(df_result["Open Price"].min() / 10) * 10)
+        open_max = int(np.ceil(df_result["Open Price"].max() / 10) * 10)
+        pct_min = int(np.floor(df_result["% Change"].min() / 10) * 10)
+        pct_max = int(np.ceil(df_result["% Change"].max() / 10) * 10)
+    except Exception:
+        open_min, open_max, pct_min, pct_max = 0, 1000, -100, 100
+
+    # Open Price Range Filter
+    open_range = st.slider(
+        "Open Price Range (₹)",
+        min_value=open_min,
+        max_value=open_max,
+        value=(open_min, open_max),
+        step=10,
+        key="open_slider"
+    )
+
+    # % Change Range Filter
+    pct_range = st.slider(
+        "% Change Range",
+        min_value=pct_min,
+        max_value=pct_max,
+        value=(pct_min, pct_max),
+        step=10,
+        key="pct_slider"
+    )
+
+    # Avg. Volume Filter
+    vol_filter = st.selectbox(
+        "Filter by Avg. Volume",
+        options=[
+            "All",
+            "More than 100K",
+            "More than 150K",
+            "More than 200K",
+            "More than 250K",
+            "More than 300K",
+            "More than 350K",
+            "More than 400K",
+            "More than 500K",
+        ],
+        key="vol_select"
+    )
+
+    # Apply filters dynamically
+    filtered_df = df_result[
+        (df_result["Open Price"] >= open_range[0])
+        & (df_result["Open Price"] <= open_range[1])
+        & (df_result["% Change"] >= pct_range[0])
+        & (df_result["% Change"] <= pct_range[1])
+    ].copy()
+
+    if vol_filter != "All":
+        vol_threshold = int(vol_filter.split(" ")[-1].replace("K", "000"))
+        filtered_df = filtered_df[filtered_df["Avg. Volume"] > vol_threshold]
+
+    # Display filtered data
+    st.write(f"📈 Showing {len(filtered_df)} results after filters:")
+    st.dataframe(filtered_df, use_container_width=True)
+
+    # Download filtered data
+    csv = filtered_df.to_csv(index=True).encode("utf-8")
+    st.download_button(
+        label="⬇️ Download Filtered CSV",
+        data=csv,
+        file_name=f"Filtered_Gainers_{st.session_state['fetched_year']}.csv",
+        mime="text/csv",
+    )
 
 # ======================
 # 🧾 FOOTNOTE
